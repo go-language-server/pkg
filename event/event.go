@@ -6,122 +6,133 @@ package event
 
 import (
 	"context"
-
-	"go.lsp.dev/pkg/event/core"
-	"go.lsp.dev/pkg/event/keys"
-	"go.lsp.dev/pkg/event/label"
+	"sync"
+	"time"
 )
 
-// Exporter is a function that handles events.
-// It may return a modified context and event.
-type Exporter func(context.Context, core.Event, label.Map) context.Context
+// Event holds the information about an event that occurred.
+// It combines the event metadata with the user supplied labels.
+type Event struct {
+	ID     uint64
+	Parent uint64    // id of the parent event for this event
+	Source Source    // source of event; if empty, set by exporter to import path
+	At     time.Time // time at which the event is delivered to the exporter.
+	Kind   Kind
+	Labels []Label
 
-// SetExporter sets the global exporter function that handles all events.
+	ctx    context.Context
+	target *target
+	labels [preallocateLabels]Label
+}
+
+// Handler is a the type for something that handles events as they occur.
+type Handler interface {
+	// Event is called with each event.
+	Event(context.Context, *Event) context.Context
+}
+
+// preallocateLabels controls the space reserved for labels in a builder.
+// Storing the first few labels directly in builders can avoid an allocation at
+// all for the very common cases of simple events. The length needs to be large
+// enough to cope with the majority of events but no so large as to cause undue
+// stack pressure.
+const preallocateLabels = 6
+
+var eventPool = sync.Pool{New: func() interface{} { return &Event{} }}
+
+// WithExporter returns a context with the exporter attached.
 // The exporter is called synchronously from the event call site, so it should
 // return quickly so as not to hold up user code.
-func SetExporter(e Exporter) {
-	core.SetExporter(core.Exporter(e))
+func WithExporter(ctx context.Context, e *Exporter) context.Context {
+	return newContext(ctx, e, 0, time.Time{})
 }
 
-// Log takes a message and a label list and combines them into a single event
-// before delivering them to the exporter.
-func Log(ctx context.Context, message string, labels ...label.Label) {
-	core.Export(ctx, core.MakeEvent([3]label.Label{
-		keys.Msg.Of(message),
-	}, labels))
+// SetDefaultExporter sets an exporter that is used if no exporter can be
+// found on the context.
+func SetDefaultExporter(e *Exporter) {
+	setDefaultExporter(e)
 }
 
-// IsLog returns true if the event was built by the Log function.
-// It is intended to be used in exporters to identify the semantics of the
-// event when deciding what to do with it.
-func IsLog(ev core.Event) bool {
-	return ev.Label(0).Key() == keys.Msg
+// New prepares a new event.
+// This is intended to avoid allocations in the steady state case, to do this
+// it uses a pool of events.
+// Events are returned to the pool when Deliver is called. Failure to call
+// Deliver will exhaust the pool and cause allocations.
+// It returns nil if there is no active exporter for this kind of event.
+func New(ctx context.Context, kind Kind) *Event {
+	var t *target
+	if v, ok := ctx.Value(contextKey).(*target); ok {
+		t = v
+	} else {
+		t = getDefaultTarget()
+	}
+	if t == nil {
+		return nil
+	}
+	//TODO: we can change this to a much faster test
+	switch kind {
+	case LogKind:
+		if !t.exporter.loggingEnabled() {
+			return nil
+		}
+	case MetricKind:
+		if !t.exporter.metricsEnabled() {
+			return nil
+		}
+	case StartKind, EndKind:
+		if !t.exporter.tracingEnabled() {
+			return nil
+		}
+	}
+	ev := eventPool.Get().(*Event)
+	*ev = Event{
+		ctx:    ctx,
+		target: t,
+		Kind:   kind,
+		Parent: t.parent,
+	}
+	ev.Labels = ev.labels[:0]
+	return ev
 }
 
-// Error takes a message and a label list and combines them into a single event
-// before delivering them to the exporter. It captures the error in the
-// delivered event.
-func Error(ctx context.Context, message string, err error, labels ...label.Label) {
-	core.Export(ctx, core.MakeEvent([3]label.Label{
-		keys.Msg.Of(message),
-		keys.Err.Of(err),
-	}, labels))
+// Clone makes a deep copy of the Event.
+// Deliver can be called on both Events independently.
+func (ev *Event) Clone() *Event {
+	ev2 := eventPool.Get().(*Event)
+	*ev2 = *ev
+	ev2.Labels = append(ev2.labels[:0], ev.Labels...)
+	return ev2
 }
 
-// IsError returns true if the event was built by the Error function.
-// It is intended to be used in exporters to identify the semantics of the
-// event when deciding what to do with it.
-func IsError(ev core.Event) bool {
-	return ev.Label(0).Key() == keys.Msg &&
-		ev.Label(1).Key() == keys.Err
+func (ev *Event) Trace() {
+	ev.prepare()
+	ev.ctx = newContext(ev.ctx, ev.target.exporter, ev.ID, ev.At)
 }
 
-// Metric sends a label event to the exporter with the supplied labels.
-func Metric(ctx context.Context, labels ...label.Label) {
-	core.Export(ctx, core.MakeEvent([3]label.Label{
-		keys.Metric.New(),
-	}, labels))
+// Deliver the event to the exporter that was found in New.
+// This also returns the event to the pool, it is an error to do anything
+// with the event after it is delivered.
+func (ev *Event) Deliver() context.Context {
+	// get the event ready to send
+	ev.prepare()
+	ctx := ev.deliver()
+	eventPool.Put(ev)
+	return ctx
 }
 
-// IsMetric returns true if the event was built by the Metric function.
-// It is intended to be used in exporters to identify the semantics of the
-// event when deciding what to do with it.
-func IsMetric(ev core.Event) bool {
-	return ev.Label(0).Key() == keys.Metric
+func (ev *Event) deliver() context.Context {
+	// hold the lock while we deliver the event
+	e := ev.target.exporter
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.handler.Event(ev.ctx, ev)
 }
 
-// Label sends a label event to the exporter with the supplied labels.
-func Label(ctx context.Context, labels ...label.Label) context.Context {
-	return core.Export(ctx, core.MakeEvent([3]label.Label{
-		keys.Label.New(),
-	}, labels))
-}
-
-// IsLabel returns true if the event was built by the Label function.
-// It is intended to be used in exporters to identify the semantics of the
-// event when deciding what to do with it.
-func IsLabel(ev core.Event) bool {
-	return ev.Label(0).Key() == keys.Label
-}
-
-// Start sends a span start event with the supplied label list to the exporter.
-// It also returns a function that will end the span, which should normally be
-// deferred.
-func Start(ctx context.Context, name string, labels ...label.Label) (context.Context, func()) {
-	return core.ExportPair(ctx,
-		core.MakeEvent([3]label.Label{
-			keys.Start.Of(name),
-		}, labels),
-		core.MakeEvent([3]label.Label{
-			keys.End.New(),
-		}, nil))
-}
-
-// IsStart returns true if the event was built by the Start function.
-// It is intended to be used in exporters to identify the semantics of the
-// event when deciding what to do with it.
-func IsStart(ev core.Event) bool {
-	return ev.Label(0).Key() == keys.Start
-}
-
-// IsEnd returns true if the event was built by the End function.
-// It is intended to be used in exporters to identify the semantics of the
-// event when deciding what to do with it.
-func IsEnd(ev core.Event) bool {
-	return ev.Label(0).Key() == keys.End
-}
-
-// Detach returns a context without an associated span.
-// This allows the creation of spans that are not children of the current span.
-func Detach(ctx context.Context) context.Context {
-	return core.Export(ctx, core.MakeEvent([3]label.Label{
-		keys.Detach.New(),
-	}, nil))
-}
-
-// IsDetach returns true if the event was built by the Detach function.
-// It is intended to be used in exporters to identify the semantics of the
-// event when deciding what to do with it.
-func IsDetach(ev core.Event) bool {
-	return ev.Label(0).Key() == keys.Detach
+func (ev *Event) Find(name string) Label {
+	for _, l := range ev.Labels {
+		if l.Name == name {
+			return l
+		}
+	}
+	return Label{}
 }
